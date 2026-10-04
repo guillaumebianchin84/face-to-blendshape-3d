@@ -187,15 +187,33 @@ class IkabotMultiView {
       this.setStatus('Analyse des 8 photos…', 'loading');
       this.results = {};
 
+      const optionalProfiles = new Set(['left70', 'right70']);
+      const skipped = [];
+
       for (const slot of SLOTS) {
         const result = this.landmarker.detect(this.images[slot.id]);
+
         if (!result.faceLandmarks?.length) {
+          if (optionalProfiles.has(slot.id)) {
+            this.results[slot.id] = null;
+            skipped.push(slot.label);
+            continue;
+          }
           throw new Error('visage non détecté : ' + slot.label);
         }
+
         this.results[slot.id] = result.faceLandmarks[0];
       }
 
-      this.setStatus('Fusion des vues et reconstruction du relief…', 'loading');
+      if (skipped.length) {
+        this.setStatus(
+          'Profil trop latéral pour MediaPipe : ' + skipped.join(', ') +
+          '. Je continue avec les vues 3/4, ce qui suffit pour reconstruire le relief.',
+          'loading'
+        );
+      } else {
+        this.setStatus('Fusion des vues et reconstruction du relief…', 'loading');
+      }
       const avatar = this.createAvatar();
       if (this.avatar) this.scene.remove(this.avatar);
       this.avatar = avatar;
@@ -234,6 +252,7 @@ class IkabotMultiView {
 
     for (const slot of SLOTS.filter((s) => s.yaw !== 0)) {
       const lm = this.results[slot.id];
+      if (!lm) continue;
       const q = this.canonical2D(lm, i);
       const theta = rad(slot.yaw);
       const s = Math.sin(theta);
