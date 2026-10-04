@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Face to 3D Blendshape Model</title>
+    <title>Ikabot - Créateur de visage 3D</title>
     <style>
         * {
             margin: 0;
@@ -254,19 +254,34 @@
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
+        /* Mobile : interface utilisable directement depuis le téléphone */
+        @media (max-width: 900px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.55em; margin-bottom: 12px; }
+            .container {
+                display: flex;
+                flex-direction: column;
+                height: auto;
+                gap: 12px;
+            }
+            .panel { padding: 14px; overflow: visible; }
+            .viewer-panel { min-height: 430px; }
+            #canvas3d { min-height: 380px; }
+            .upload-area { padding: 24px 12px; }
+        }
     </style>
 </head>
 <body>
-    <h1>🎭 Face to 3D Blendshape Model</h1>
+    <h1>🎭 Ikabot — Créateur de visage 3D</h1>
     
     <div class="container">
         <!-- Left Panel - Upload -->
         <div class="panel">
-            <h2>📸 Upload Photo</h2>
+            <h2>📸 Photo du visage</h2>
             <div class="upload-area" id="uploadArea">
                 <div class="upload-icon">📁</div>
-                <p>Click or drag an image here</p>
-                <p style="font-size: 0.8em; color: #666; margin-top: 10px;">Supported: JPG, PNG</p>
+                <p>Touche ici pour choisir une photo</p>
+                <p style="font-size: 0.8em; color: #666; margin-top: 10px;">JPG, PNG ou WebP — photo de face conseillée</p>
             </div>
             <input type="file" id="fileInput" accept="image/*" style="display: none;">
             <img id="preview" alt="Preview">
@@ -274,14 +289,14 @@
             <div class="status" id="status"></div>
             
             <button id="processBtn" disabled>
-                <span id="processBtnText">Process Image</span>
+                <span id="processBtnText">Créer le visage 3D</span>
             </button>
-            <button id="exportBtn" disabled>💾 Export GLB Model</button>
+            <button id="exportBtn" disabled>💾 Télécharger le GLB</button>
         </div>
 
         <!-- Center Panel - 3D Viewer -->
         <div class="panel viewer-panel">
-            <h2>🎬 3D Preview</h2>
+            <h2>🎬 Aperçu 3D</h2>
             <canvas id="canvas3d"></canvas>
         </div>
 
