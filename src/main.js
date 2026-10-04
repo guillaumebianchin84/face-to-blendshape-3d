@@ -11,16 +11,16 @@ const INNER_LOWER_LIP = [14,317,402,318,324,17,84,181,91,146,87,178,88,95];
 const OUTER_MOUTH = [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95,78,191,80,81,82,13,312,311,310,415,308,291,409,270,269,267,0,37,39,40,185];
 
 const VISEMES = [
-  { ms: 140, open: 0.10, round: 0.00, smile: 0.00 },
-  { ms: 170, open: 0.72, round: 0.00, smile: 0.02 },
-  { ms: 120, open: 0.26, round: 0.00, smile: 0.05 },
-  { ms: 150, open: 0.46, round: 0.00, smile: 0.20 },
-  { ms: 95,  open: 0.04, round: 0.00, smile: 0.00 },
-  { ms: 165, open: 0.52, round: 0.78, smile: 0.00 },
-  { ms: 120, open: 0.20, round: 0.42, smile: 0.00 },
-  { ms: 145, open: 0.62, round: 0.05, smile: 0.04 },
-  { ms: 90,  open: 0.06, round: 0.00, smile: 0.00 },
-  { ms: 150, open: 0.34, round: 0.00, smile: 0.18 },
+  { ms: 140, open: 0.08, round: 0.00, smile: 0.00 },
+  { ms: 175, open: 0.98, round: 0.00, smile: 0.02 },
+  { ms: 120, open: 0.34, round: 0.00, smile: 0.05 },
+  { ms: 155, open: 0.62, round: 0.00, smile: 0.20 },
+  { ms: 95,  open: 0.03, round: 0.00, smile: 0.00 },
+  { ms: 170, open: 0.72, round: 0.82, smile: 0.00 },
+  { ms: 120, open: 0.26, round: 0.46, smile: 0.00 },
+  { ms: 150, open: 0.86, round: 0.05, smile: 0.04 },
+  { ms: 90,  open: 0.05, round: 0.00, smile: 0.00 },
+  { ms: 150, open: 0.46, round: 0.00, smile: 0.18 },
 ];
 
 class Ikabot2DRig {
@@ -263,7 +263,7 @@ class Ikabot2DRig {
     this.lastFrame = now;
     this.updateSpeech(now);
 
-    const tau = 72;
+    const tau = 86;
     const a = 1 - Math.exp(-dt / tau);
     this.current.open += (this.target.open - this.current.open) * a;
     this.current.round += (this.target.round - this.current.round) * a;
@@ -305,8 +305,8 @@ class Ikabot2DRig {
         const below = Math.max(0, Math.min(1, (p.y - cy) / (width * 0.62) + 0.22));
         const above = Math.max(0, Math.min(1, (cy - p.y) / (width * 0.45) + 0.12));
 
-        p.y += open * width * 0.115 * mouthInfluence * (0.35 + below * 0.95);
-        p.y -= open * width * 0.022 * mouthInfluence * above;
+        p.y += open * width * 0.155 * mouthInfluence * (0.30 + below * 1.05);
+        p.y -= open * width * 0.035 * mouthInfluence * above;
         p.x += (cx - p.x) * round * 0.17 * mouthInfluence;
 
         if (smile > 0) {
@@ -318,10 +318,10 @@ class Ikabot2DRig {
     }
 
     for (const i of INNER_UPPER_LIP) {
-      if (pts[i]) pts[i].y -= open * width * 0.030;
+      if (pts[i]) pts[i].y -= open * width * 0.045;
     }
     for (const i of INNER_LOWER_LIP) {
-      if (pts[i]) pts[i].y += open * width * 0.105;
+      if (pts[i]) pts[i].y += open * width * 0.170;
     }
     for (const i of OUTER_MOUTH) {
       if (pts[i]) pts[i].x += (cx - pts[i].x) * round * 0.09;
