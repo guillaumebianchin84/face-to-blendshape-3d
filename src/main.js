@@ -1,567 +1,454 @@
-import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
-import { ARKitBlendshapeMapper } from './arkit-mapper.js';
-import { FaceMeshGenerator } from './face-mesh-generator.js';
-import { TextureMapper } from './texture-mapper.js';
-import headModelUrl from '../head.glb?url';
+import { FACEMESH_TESSELATION } from './face-mesh-triangulation.js';
 
-class FaceToBlendshape3D {
-    constructor() {
-        this.faceLandmarker = null;
-        this.scene = null;
-        this.camera = null;
-        this.renderer = null;
-        this.controls = null;
-        this.faceMesh = null;
-        this.headModel = null;
-        this.blendshapes = {};
-        this.currentImage = null;
-        this.textureCanvas = null;
-        
-        // Debug parameters
-        this.debugParams = {
-            head: {
-                scaleMultiplierX: 1.15,
-                scaleMultiplierY: 1.45,
-                scaleMultiplierZ: 1.45,
-                posOffsetX: 0,
-                posOffsetY: 0,
-                posOffsetZ: 0,
-                rotationX: 0,
-                rotationY: 0,
-                rotationZ: 0,
-                pushBackFactor: 0.40
-            },
-            face: {
-                scaleX: 1.0,
-                scaleY: 1.0,
-                scaleZ: 1.0,
-                posOffsetX: 0,
-                posOffsetY: 0,
-                posOffsetZ: 0,
-                rotationX: 0,
-                rotationY: 0,
-                rotationZ: 0
-            }
-        };
-        
-        this.faceData = null;
-        
-        this.init();
+const W = 512;
+const H = 512;
+
+const LEFT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+const RIGHT_EYE = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
+const INNER_UPPER_LIP = [13,312,311,310,415,0,185,40,39,37,82,81,80,191];
+const INNER_LOWER_LIP = [14,317,402,318,324,17,84,181,91,146,87,178,88,95];
+const OUTER_MOUTH = [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95,78,191,80,81,82,13,312,311,310,415,308,291,409,270,269,267,0,37,39,40,185];
+
+const VISEMES = [
+  { ms: 140, open: 0.10, round: 0.00, smile: 0.00 },
+  { ms: 170, open: 0.72, round: 0.00, smile: 0.02 },
+  { ms: 120, open: 0.26, round: 0.00, smile: 0.05 },
+  { ms: 150, open: 0.46, round: 0.00, smile: 0.20 },
+  { ms: 95,  open: 0.04, round: 0.00, smile: 0.00 },
+  { ms: 165, open: 0.52, round: 0.78, smile: 0.00 },
+  { ms: 120, open: 0.20, round: 0.42, smile: 0.00 },
+  { ms: 145, open: 0.62, round: 0.05, smile: 0.04 },
+  { ms: 90,  open: 0.06, round: 0.00, smile: 0.00 },
+  { ms: 150, open: 0.34, round: 0.00, smile: 0.18 },
+];
+
+class Ikabot2DRig {
+  constructor() {
+    this.faceLandmarker = null;
+    this.image = null;
+    this.landmarks = null;
+    this.base = null;
+    this.crop = null;
+    this.ready = false;
+    this.speaking = false;
+    this.speechStartedAt = 0;
+    this.speechEndsAt = 0;
+    this.current = { open: 0, round: 0, smile: 0 };
+    this.target = { open: 0, round: 0, smile: 0 };
+    this.nextBlinkAt = performance.now() + 1800 + Math.random() * 1800;
+    this.blinkStartedAt = 0;
+    this.lastFrame = performance.now();
+    this.lastPaint = 0;
+
+    this.canvas = document.getElementById('ikabotCanvas');
+    this.ctx = this.canvas.getContext('2d', { alpha: false });
+    this.canvas.width = W;
+    this.canvas.height = H;
+    this.ctx.imageSmoothingEnabled = true;
+    this.ctx.imageSmoothingQuality = 'high';
+
+    this.init();
+  }
+
+  async init() {
+    this.bindUI();
+    this.paintEmpty();
+    this.status('Chargement du moteur visage…', 'loading');
+
+    try {
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+      );
+      this.faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        outputFaceBlendshapes: false,
+        outputFacialTransformationMatrixes: false,
+        runningMode: 'IMAGE',
+        numFaces: 1
+      });
+      this.status('Moteur prêt. Choisis la photo.', 'success');
+    } catch (e) {
+      console.error(e);
+      this.status('Impossible de charger MediaPipe : ' + e.message, 'error');
     }
-    
-    async init() {
-        await this.initMediaPipe();
-        this.initThreeJS();
-        this.initEventListeners();
-        this.initDebugControls();
-        this.animate();
+
+    requestAnimationFrame((t) => this.loop(t));
+  }
+
+  bindUI() {
+    const input = document.getElementById('fileInput');
+    const upload = document.getElementById('uploadArea');
+    const process = document.getElementById('processBtn');
+    const talk = document.getElementById('talkBtn');
+    const stop = document.getElementById('stopBtn');
+
+    upload.addEventListener('click', () => input.click());
+    input.addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (file) this.loadFile(file);
+    });
+
+    upload.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      upload.classList.add('dragover');
+    });
+    upload.addEventListener('dragleave', () => upload.classList.remove('dragover'));
+    upload.addEventListener('drop', (e) => {
+      e.preventDefault();
+      upload.classList.remove('dragover');
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file && file.type && file.type.startsWith('image/')) this.loadFile(file);
+    });
+
+    process.addEventListener('click', () => this.process());
+    talk.addEventListener('click', () => this.startSpeechDemo());
+    stop.addEventListener('click', () => this.stopSpeech());
+  }
+
+  loadFile(file) {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = url;
+      this.image = img;
+      this.landmarks = null;
+      this.ready = false;
+      this.drawFittedImage();
+      document.getElementById('processBtn').disabled = false;
+      document.getElementById('talkBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = true;
+      this.status('Photo chargée. Appuie sur « Analyser le visage ».', 'success');
+    };
+    img.onerror = () => this.status('Impossible de lire cette image.', 'error');
+    img.src = url;
+  }
+
+  async process() {
+    if (!this.image || !this.faceLandmarker) return;
+    const button = document.getElementById('processBtn');
+    button.disabled = true;
+    this.status('Analyse du visage…', 'loading');
+
+    try {
+      const results = this.faceLandmarker.detect(this.image);
+      if (!results.faceLandmarks || !results.faceLandmarks.length) {
+        throw new Error('aucun visage détecté');
+      }
+      this.landmarks = results.faceLandmarks[0];
+      this.prepareRig();
+      this.ready = true;
+      document.getElementById('talkBtn').disabled = false;
+      this.status('Visage prêt. Lance « Test parole » : aucun changement de photo.', 'success');
+      this.paintFrame(0);
+    } catch (e) {
+      console.error(e);
+      this.status('Erreur : ' + e.message, 'error');
+    } finally {
+      button.disabled = false;
     }
-    
-    async initMediaPipe() {
-        try {
-            const vision = await FilesetResolver.forVisionTasks(
-                'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
-            );
-            this.faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-                baseOptions: {
-                    modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task',
-                    delegate: 'GPU'
-                },
-                outputFaceBlendshapes: true,
-                outputFacialTransformationMatrixes: true,
-                runningMode: 'IMAGE',
-                numFaces: 1
-            });
-            this.showStatus('MediaPipe initialized successfully', 'success');
-        } catch (error) {
-            console.error('MediaPipe initialization error:', error);
-            this.showStatus('Failed to initialize MediaPipe: ' + error.message, 'error');
+  }
+
+  prepareRig() {
+    const xs = this.landmarks.map((p) => p.x * this.image.width);
+    const ys = this.landmarks.map((p) => p.y * this.image.height);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const fw = maxX - minX;
+    const fh = maxY - minY;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2 + fh * 0.08;
+
+    let size = Math.max(fw * 1.95, fh * 1.72);
+    size = Math.min(size, this.image.width, this.image.height);
+    let x = cx - size / 2;
+    let y = cy - size / 2;
+    x = Math.max(0, Math.min(x, this.image.width - size));
+    y = Math.max(0, Math.min(y, this.image.height - size));
+    this.crop = { x, y, size };
+
+    this.base = this.landmarks.map((p) => {
+      const sx = p.x * this.image.width;
+      const sy = p.y * this.image.height;
+      return {
+        sx,
+        sy,
+        x: (sx - x) / size * W,
+        y: (sy - y) / size * H
+      };
+    });
+
+    this.mouth = {
+      cx: (this.base[61].x + this.base[291].x) / 2,
+      cy: (this.base[13].y + this.base[14].y) / 2,
+      width: Math.max(20, Math.abs(this.base[291].x - this.base[61].x))
+    };
+
+    this.eyeCenters = {
+      left: {
+        x: (this.base[33].x + this.base[133].x) / 2,
+        y: (this.base[159].y + this.base[145].y) / 2,
+      },
+      right: {
+        x: (this.base[362].x + this.base[263].x) / 2,
+        y: (this.base[386].y + this.base[374].y) / 2,
+      }
+    };
+  }
+
+  startSpeechDemo() {
+    if (!this.ready) return;
+    this.speaking = true;
+    this.speechStartedAt = performance.now();
+    this.speechEndsAt = this.speechStartedAt + 10000;
+    document.getElementById('talkBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+    document.getElementById('state').textContent = 'PARLE';
+  }
+
+  stopSpeech() {
+    this.speaking = false;
+    this.target = { open: 0, round: 0, smile: 0 };
+    document.getElementById('talkBtn').disabled = !this.ready;
+    document.getElementById('stopBtn').disabled = true;
+    document.getElementById('state').textContent = 'REPOS';
+  }
+
+  updateSpeech(now) {
+    if (!this.speaking) {
+      this.target = { open: 0, round: 0, smile: 0 };
+      return;
+    }
+
+    if (now >= this.speechEndsAt) {
+      this.stopSpeech();
+      return;
+    }
+
+    const elapsed = now - this.speechStartedAt;
+    const cycle = VISEMES.reduce((a, v) => a + v.ms, 0);
+    let t = elapsed % cycle;
+    let chosen = VISEMES[0];
+    for (const v of VISEMES) {
+      if (t <= v.ms) {
+        chosen = v;
+        break;
+      }
+      t -= v.ms;
+    }
+    this.target = chosen;
+  }
+
+  blinkAmount(now) {
+    if (!this.ready) return 0;
+    if (!this.blinkStartedAt && now >= this.nextBlinkAt) this.blinkStartedAt = now;
+    if (!this.blinkStartedAt) return 0;
+
+    const d = now - this.blinkStartedAt;
+    const duration = 170;
+    if (d >= duration) {
+      this.blinkStartedAt = 0;
+      this.nextBlinkAt = now + 2500 + Math.random() * 2800;
+      return 0;
+    }
+    return Math.sin(Math.PI * d / duration);
+  }
+
+  loop(now) {
+    const dt = Math.min(50, now - this.lastFrame);
+    this.lastFrame = now;
+    this.updateSpeech(now);
+
+    const tau = 72;
+    const a = 1 - Math.exp(-dt / tau);
+    this.current.open += (this.target.open - this.current.open) * a;
+    this.current.round += (this.target.round - this.current.round) * a;
+    this.current.smile += (this.target.smile - this.current.smile) * a;
+
+    const blink = this.blinkAmount(now);
+    const moving =
+      this.speaking ||
+      blink > 0.002 ||
+      this.current.open > 0.003 ||
+      this.current.round > 0.003 ||
+      this.current.smile > 0.003;
+
+    if (this.ready && moving && now - this.lastPaint >= 30) {
+      this.lastPaint = now;
+      this.paintFrame(blink);
+    } else if (this.ready && !moving && now - this.lastPaint > 250) {
+      this.lastPaint = now;
+      this.paintFrame(0);
+    }
+
+    requestAnimationFrame((t) => this.loop(t));
+  }
+
+  deform(blink) {
+    const pts = this.base.map((p) => ({ ...p }));
+    const { cx, cy, width } = this.mouth;
+    const open = this.current.open;
+    const round = this.current.round;
+    const smile = this.current.smile;
+
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const dx = (p.x - cx) / width;
+      const dy = (p.y - cy) / width;
+      const mouthInfluence = Math.exp(-(dx * dx * 2.1 + dy * dy * 4.8));
+
+      if (mouthInfluence > 0.015) {
+        const below = Math.max(0, Math.min(1, (p.y - cy) / (width * 0.62) + 0.22));
+        const above = Math.max(0, Math.min(1, (cy - p.y) / (width * 0.45) + 0.12));
+
+        p.y += open * width * 0.115 * mouthInfluence * (0.35 + below * 0.95);
+        p.y -= open * width * 0.022 * mouthInfluence * above;
+        p.x += (cx - p.x) * round * 0.17 * mouthInfluence;
+
+        if (smile > 0) {
+          const side = Math.min(1, Math.abs(p.x - cx) / (width * 0.55));
+          p.y -= smile * width * 0.075 * mouthInfluence * side;
+          p.x += Math.sign(p.x - cx) * smile * width * 0.025 * mouthInfluence;
         }
+      }
     }
-    
-    initThreeJS() {
-        const canvas = document.getElementById('canvas3d');
-        const container = canvas.parentElement;
-        this.scene = new THREE.Scene();
-        this.scene.background = new THREE.Color(0xf8f9ff);
-        this.camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
-        this.camera.position.z = 2;
-        this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
-        this.renderer.setSize(container.clientWidth, container.clientHeight);
-        this.renderer.setPixelRatio(window.devicePixelRatio);
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        
-        this.controls = new OrbitControls(this.camera, canvas);
-        this.controls.enableDamping = true;
-        this.controls.dampingFactor = 0.05;
-        
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
-        this.scene.add(ambientLight);
-        const frontLight = new THREE.DirectionalLight(0xffffff, 1.0);
-        frontLight.position.set(0, 0, 5);
-        this.scene.add(frontLight);
-        const topLight = new THREE.DirectionalLight(0xffffff, 0.8);
-        topLight.position.set(0, 5, 0);
-        this.scene.add(topLight);
-        const backLight = new THREE.DirectionalLight(0xffffff, 0.5);
-        backLight.position.set(0, 0, -5);
-        this.scene.add(backLight);
-        const leftLight = new THREE.PointLight(0xffffff, 0.5);
-        leftLight.position.set(-5, 0, 0);
-        this.scene.add(leftLight);
-        const rightLight = new THREE.PointLight(0xffffff, 0.5);
-        rightLight.position.set(5, 0, 0);
-        this.scene.add(rightLight);
-        
-        const loader = new GLTFLoader();
-        loader.load(headModelUrl, (gltf) => {
-            this.headModel = gltf.scene;
-            this.headModel.traverse((child) => {
-                if (child.isMesh) {
-                    const forcedMat = new THREE.MeshStandardMaterial({
-                        color: new THREE.Color(0.8, 0.6, 0.5),
-                        roughness: 0.6,
-                        metalness: 0.0,
-                        emissive: new THREE.Color(0.3, 0.2, 0.15),
-                        emissiveIntensity: 0.4,
-                        side: THREE.FrontSide,
-                        flatShading: false
-                    });
-                    child.material = forcedMat;
-                    child.castShadow = false;
-                    child.receiveShadow = false;
-                }
-            });
-            const box = new THREE.Box3().setFromObject(this.headModel);
-            const center = box.getCenter(new THREE.Vector3());
-            this.headModel.position.sub(center);
-            this.scene.add(this.headModel);
-            this.headModel.visible = false;
-        }, undefined, (error) => {
-            console.error('Error loading head model:', error);
-            this.showStatus('Failed to load head model.', 'error');
-        });
-        
-        window.addEventListener('resize', () => this.onResize());
-    }
-    
-    initDebugControls() {
-        // Head controls
-        const headSliders = {
-            scaleX: document.getElementById('headScaleXSlider'),
-            scaleY: document.getElementById('headScaleYSlider'),
-            scaleZ: document.getElementById('headScaleZSlider'),
-            posX: document.getElementById('headPosXSlider'),
-            posY: document.getElementById('headPosYSlider'),
-            posZ: document.getElementById('headPosZSlider'),
-            rotX: document.getElementById('headRotXSlider'),
-            rotY: document.getElementById('headRotYSlider'),
-            rotZ: document.getElementById('headRotZSlider'),
-            pushBack: document.getElementById('headPushBackSlider')
-        };
-        
-        const headValues = {
-            scaleX: document.getElementById('headScaleXValue'),
-            scaleY: document.getElementById('headScaleYValue'),
-            scaleZ: document.getElementById('headScaleZValue'),
-            posX: document.getElementById('headPosXValue'),
-            posY: document.getElementById('headPosYValue'),
-            posZ: document.getElementById('headPosZValue'),
-            rotX: document.getElementById('headRotXValue'),
-            rotY: document.getElementById('headRotYValue'),
-            rotZ: document.getElementById('headRotZValue'),
-            pushBack: document.getElementById('headPushBackValue')
-        };
-        
-        // Face controls
-        const faceSliders = {
-            scaleX: document.getElementById('faceScaleXSlider'),
-            scaleY: document.getElementById('faceScaleYSlider'),
-            scaleZ: document.getElementById('faceScaleZSlider'),
-            posX: document.getElementById('facePosXSlider'),
-            posY: document.getElementById('facePosYSlider'),
-            posZ: document.getElementById('facePosZSlider'),
-            rotX: document.getElementById('faceRotXSlider'),
-            rotY: document.getElementById('faceRotYSlider'),
-            rotZ: document.getElementById('faceRotZSlider')
-        };
-        
-        const faceValues = {
-            scaleX: document.getElementById('faceScaleXValue'),
-            scaleY: document.getElementById('faceScaleYValue'),
-            scaleZ: document.getElementById('faceScaleZValue'),
-            posX: document.getElementById('facePosXValue'),
-            posY: document.getElementById('facePosYValue'),
-            posZ: document.getElementById('facePosZValue'),
-            rotX: document.getElementById('faceRotXValue'),
-            rotY: document.getElementById('faceRotYValue'),
-            rotZ: document.getElementById('faceRotZValue')
-        };
-        
-        // Head slider listeners
-        headSliders.scaleX.addEventListener('input', (e) => { this.debugParams.head.scaleMultiplierX = parseFloat(e.target.value); headValues.scaleX.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.scaleY.addEventListener('input', (e) => { this.debugParams.head.scaleMultiplierY = parseFloat(e.target.value); headValues.scaleY.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.scaleZ.addEventListener('input', (e) => { this.debugParams.head.scaleMultiplierZ = parseFloat(e.target.value); headValues.scaleZ.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.posX.addEventListener('input', (e) => { this.debugParams.head.posOffsetX = parseFloat(e.target.value); headValues.posX.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.posY.addEventListener('input', (e) => { this.debugParams.head.posOffsetY = parseFloat(e.target.value); headValues.posY.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.posZ.addEventListener('input', (e) => { this.debugParams.head.posOffsetZ = parseFloat(e.target.value); headValues.posZ.textContent = e.target.value; this.updateHeadTransform(); });
-        headSliders.rotX.addEventListener('input', (e) => { this.debugParams.head.rotationX = parseFloat(e.target.value); headValues.rotX.textContent = e.target.value + '°'; this.updateHeadTransform(); });
-        headSliders.rotY.addEventListener('input', (e) => { this.debugParams.head.rotationY = parseFloat(e.target.value); headValues.rotY.textContent = e.target.value + '°'; this.updateHeadTransform(); });
-        headSliders.rotZ.addEventListener('input', (e) => { this.debugParams.head.rotationZ = parseFloat(e.target.value); headValues.rotZ.textContent = e.target.value + '°'; this.updateHeadTransform(); });
-        headSliders.pushBack.addEventListener('input', (e) => { this.debugParams.head.pushBackFactor = parseFloat(e.target.value); headValues.pushBack.textContent = e.target.value; this.updateHeadTransform(); });
-        
-        // Face slider listeners
-        faceSliders.scaleX.addEventListener('input', (e) => { this.debugParams.face.scaleX = parseFloat(e.target.value); faceValues.scaleX.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.scaleY.addEventListener('input', (e) => { this.debugParams.face.scaleY = parseFloat(e.target.value); faceValues.scaleY.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.scaleZ.addEventListener('input', (e) => { this.debugParams.face.scaleZ = parseFloat(e.target.value); faceValues.scaleZ.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.posX.addEventListener('input', (e) => { this.debugParams.face.posOffsetX = parseFloat(e.target.value); faceValues.posX.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.posY.addEventListener('input', (e) => { this.debugParams.face.posOffsetY = parseFloat(e.target.value); faceValues.posY.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.posZ.addEventListener('input', (e) => { this.debugParams.face.posOffsetZ = parseFloat(e.target.value); faceValues.posZ.textContent = e.target.value; this.updateFaceTransform(); });
-        faceSliders.rotX.addEventListener('input', (e) => { this.debugParams.face.rotationX = parseFloat(e.target.value); faceValues.rotX.textContent = e.target.value + '°'; this.updateFaceTransform(); });
-        faceSliders.rotY.addEventListener('input', (e) => { this.debugParams.face.rotationY = parseFloat(e.target.value); faceValues.rotY.textContent = e.target.value + '°'; this.updateFaceTransform(); });
-        faceSliders.rotZ.addEventListener('input', (e) => { this.debugParams.face.rotationZ = parseFloat(e.target.value); faceValues.rotZ.textContent = e.target.value + '°'; this.updateFaceTransform(); });
-        
-        // Reset button
-        document.getElementById('resetDebugBtn').addEventListener('click', () => {
-            // Reset head
-            headSliders.scaleX.value = 1.15; headSliders.scaleY.value = 1.45; headSliders.scaleZ.value = 1.45;
-            headSliders.posX.value = 0; headSliders.posY.value = 0; headSliders.posZ.value = 0;
-            headSliders.rotX.value = 0; headSliders.rotY.value = 0; headSliders.rotZ.value = 0;
-            headSliders.pushBack.value = 0.40;
-            // Reset face
-            faceSliders.scaleX.value = 1.0; faceSliders.scaleY.value = 1.0; faceSliders.scaleZ.value = 1.0;
-            faceSliders.posX.value = 0; faceSliders.posY.value = 0; faceSliders.posZ.value = 0;
-            faceSliders.rotX.value = 0; faceSliders.rotY.value = 0; faceSliders.rotZ.value = 0;
-            // Trigger updates
-            Object.values(headSliders).forEach(s => s.dispatchEvent(new Event('input')));
-            Object.values(faceSliders).forEach(s => s.dispatchEvent(new Event('input')));
-        });
-        
-        // Copy button
-        document.getElementById('copyValuesBtn').addEventListener('click', () => {
-            const text = `HEAD:
-scaleMultiplierX: ${this.debugParams.head.scaleMultiplierX}
-scaleMultiplierY: ${this.debugParams.head.scaleMultiplierY}
-scaleMultiplierZ: ${this.debugParams.head.scaleMultiplierZ}
-posOffsetX: ${this.debugParams.head.posOffsetX}
-posOffsetY: ${this.debugParams.head.posOffsetY}
-posOffsetZ: ${this.debugParams.head.posOffsetZ}
-rotationX: ${this.debugParams.head.rotationX}
-rotationY: ${this.debugParams.head.rotationY}
-rotationZ: ${this.debugParams.head.rotationZ}
-pushBackFactor: ${this.debugParams.head.pushBackFactor}
 
-FACE:
-scaleX: ${this.debugParams.face.scaleX}
-scaleY: ${this.debugParams.face.scaleY}
-scaleZ: ${this.debugParams.face.scaleZ}
-posOffsetX: ${this.debugParams.face.posOffsetX}
-posOffsetY: ${this.debugParams.face.posOffsetY}
-posOffsetZ: ${this.debugParams.face.posOffsetZ}
-rotationX: ${this.debugParams.face.rotationX}
-rotationY: ${this.debugParams.face.rotationY}
-rotationZ: ${this.debugParams.face.rotationZ}`;
-            navigator.clipboard.writeText(text);
-            alert('Values copied to clipboard!');
-        });
+    for (const i of INNER_UPPER_LIP) {
+      if (pts[i]) pts[i].y -= open * width * 0.030;
     }
-    
-    updateHeadTransform() {
-        if (!this.headModel || !this.faceData) return;
-        
-        const { faceWidth, faceHeight, faceCenter } = this.faceData;
-        
-        this.headModel.scale.set(1, 1, 1);
-        this.headModel.rotation.set(0, 0, 0);
-        this.headModel.position.set(0, 0, 0);
-        this.headModel.updateMatrixWorld(true);
-        
-        const resetHeadBox = new THREE.Box3().setFromObject(this.headModel);
-        const headWidth = resetHeadBox.max.x - resetHeadBox.min.x;
-        const headHeight = resetHeadBox.max.y - resetHeadBox.min.y;
-        
-        const targetHeadWidth = faceWidth * this.debugParams.head.scaleMultiplierX;
-        const targetHeadHeight = faceHeight * this.debugParams.head.scaleMultiplierY;
-        
-        const scaleX = targetHeadWidth / headWidth;
-        const scaleY = targetHeadHeight / headHeight;
-        const scaleZ = Math.max(scaleX, scaleY) * (this.debugParams.head.scaleMultiplierZ / this.debugParams.head.scaleMultiplierY);
-        
-        this.headModel.scale.set(scaleX, scaleY, scaleZ);
-        
-        // Apply rotation (degrees to radians)
-        this.headModel.rotation.set(
-            THREE.MathUtils.degToRad(this.debugParams.head.rotationX),
-            THREE.MathUtils.degToRad(this.debugParams.head.rotationY),
-            THREE.MathUtils.degToRad(this.debugParams.head.rotationZ)
-        );
-        
-        this.headModel.updateMatrixWorld(true);
-        
-        const scaledHeadBox = new THREE.Box3().setFromObject(this.headModel);
-        const scaledHeadCenter = scaledHeadBox.getCenter(new THREE.Vector3());
-        const scaledHeadDepth = scaledHeadBox.max.z - scaledHeadBox.min.z;
-        
-        const offsetX = faceCenter.x - scaledHeadCenter.x + this.debugParams.head.posOffsetX;
-        const offsetY = faceCenter.y - scaledHeadCenter.y + this.debugParams.head.posOffsetY;
-        let targetZ = faceCenter.z - scaledHeadCenter.z;
-        const pushBack = scaledHeadDepth * this.debugParams.head.pushBackFactor;
-        const offsetZ = targetZ - pushBack + this.debugParams.head.posOffsetZ;
-        
-        this.headModel.position.set(offsetX, offsetY, offsetZ);
-        this.updateDebugDisplay();
+    for (const i of INNER_LOWER_LIP) {
+      if (pts[i]) pts[i].y += open * width * 0.105;
     }
-    
-    updateFaceTransform() {
-        if (!this.faceMesh || !this.faceData) return;
-        
-        const { originalPosition } = this.faceData;
-        
-        this.faceMesh.scale.set(
-            this.debugParams.face.scaleX,
-            this.debugParams.face.scaleY,
-            this.debugParams.face.scaleZ
-        );
-        
-        // Apply rotation (degrees to radians)
-        this.faceMesh.rotation.set(
-            THREE.MathUtils.degToRad(this.debugParams.face.rotationX),
-            THREE.MathUtils.degToRad(this.debugParams.face.rotationY),
-            THREE.MathUtils.degToRad(this.debugParams.face.rotationZ)
-        );
-        
-        this.faceMesh.position.set(
-            originalPosition.x + this.debugParams.face.posOffsetX,
-            originalPosition.y + this.debugParams.face.posOffsetY,
-            originalPosition.z + this.debugParams.face.posOffsetZ
-        );
-        
-        // Recalculate face data after transform
-        this.faceMesh.geometry.computeBoundingBox();
-        const faceBox = new THREE.Box3().setFromObject(this.faceMesh);
-        const faceWidth = faceBox.max.x - faceBox.min.x;
-        const faceHeight = faceBox.max.y - faceBox.min.y;
-        const faceCenter = faceBox.getCenter(new THREE.Vector3());
-        
-        this.faceData.faceWidth = faceWidth;
-        this.faceData.faceHeight = faceHeight;
-        this.faceData.faceCenter = faceCenter;
-        
-        this.updateHeadTransform();
-        this.updateDebugDisplay();
+    for (const i of OUTER_MOUTH) {
+      if (pts[i]) pts[i].x += (cx - pts[i].x) * round * 0.09;
     }
-    
-    updateDebugDisplay() {
-        const debugValues = document.getElementById('debugValues');
-        debugValues.textContent = `HEAD:
-{
-  scaleMultiplierX: ${this.debugParams.head.scaleMultiplierX},
-  scaleMultiplierY: ${this.debugParams.head.scaleMultiplierY},
-  scaleMultiplierZ: ${this.debugParams.head.scaleMultiplierZ},
-  posOffsetX: ${this.debugParams.head.posOffsetX},
-  posOffsetY: ${this.debugParams.head.posOffsetY},
-  posOffsetZ: ${this.debugParams.head.posOffsetZ},
-  rotationX: ${this.debugParams.head.rotationX},
-  rotationY: ${this.debugParams.head.rotationY},
-  rotationZ: ${this.debugParams.head.rotationZ},
-  pushBackFactor: ${this.debugParams.head.pushBackFactor}
+
+    if (blink > 0) {
+      this.applyBlink(pts, LEFT_EYE, this.eyeCenters.left, blink);
+      this.applyBlink(pts, RIGHT_EYE, this.eyeCenters.right, blink);
+    }
+
+    return pts;
+  }
+
+  applyBlink(pts, indices, center, amount) {
+    for (const i of indices) {
+      const p = pts[i];
+      if (!p) continue;
+      p.y += (center.y - p.y) * amount * 0.92;
+    }
+  }
+
+  paintFrame(blink) {
+    this.drawBase();
+    if (!this.base || !this.crop) return;
+
+    const dst = this.deform(blink);
+    const moved = new Float32Array(dst.length);
+    for (let i = 0; i < dst.length; i++) {
+      const dx = dst[i].x - this.base[i].x;
+      const dy = dst[i].y - this.base[i].y;
+      moved[i] = Math.hypot(dx, dy);
+    }
+
+    for (let i = 0; i < FACEMESH_TESSELATION.length; i += 3) {
+      const ia = FACEMESH_TESSELATION[i];
+      const ib = FACEMESH_TESSELATION[i + 1];
+      const ic = FACEMESH_TESSELATION[i + 2];
+      if ((moved[ia] + moved[ib] + moved[ic]) < 0.08) continue;
+      this.drawTriangle(this.base[ia], this.base[ib], this.base[ic], dst[ia], dst[ib], dst[ic]);
+    }
+  }
+
+  drawTriangle(sa, sb, sc, da, db, dc) {
+    const sx0 = sa.sx, sy0 = sa.sy;
+    const sx1 = sb.sx, sy1 = sb.sy;
+    const sx2 = sc.sx, sy2 = sc.sy;
+    const dx0 = da.x, dy0 = da.y;
+    const dx1 = db.x, dy1 = db.y;
+    const dx2 = dc.x, dy2 = dc.y;
+
+    const den = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+    if (Math.abs(den) < 0.00001) return;
+
+    const a = (dx0 * (sy1 - sy2) + dx1 * (sy2 - sy0) + dx2 * (sy0 - sy1)) / den;
+    const c = (dx0 * (sx2 - sx1) + dx1 * (sx0 - sx2) + dx2 * (sx1 - sx0)) / den;
+    const e = (dx0 * (sx1 * sy2 - sx2 * sy1) + dx1 * (sx2 * sy0 - sx0 * sy2) + dx2 * (sx0 * sy1 - sx1 * sy0)) / den;
+    const b = (dy0 * (sy1 - sy2) + dy1 * (sy2 - sy0) + dy2 * (sy0 - sy1)) / den;
+    const d = (dy0 * (sx2 - sx1) + dy1 * (sx0 - sx2) + dy2 * (sx1 - sx0)) / den;
+    const f = (dy0 * (sx1 * sy2 - sx2 * sy1) + dy1 * (sx2 * sy0 - sx0 * sy2) + dy2 * (sx0 * sy1 - sx1 * sy0)) / den;
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(dx0, dy0);
+    ctx.lineTo(dx1, dy1);
+    ctx.lineTo(dx2, dy2);
+    ctx.closePath();
+    ctx.clip();
+    ctx.setTransform(a, b, c, d, e, f);
+    ctx.drawImage(this.image, 0, 0);
+    ctx.restore();
+  }
+
+  drawBase() {
+    if (!this.image) {
+      this.paintEmpty();
+      return;
+    }
+
+    if (this.crop) {
+      this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+      this.ctx.drawImage(
+        this.image,
+        this.crop.x,
+        this.crop.y,
+        this.crop.size,
+        this.crop.size,
+        0,
+        0,
+        W,
+        H
+      );
+    } else {
+      this.drawFittedImage();
+    }
+  }
+
+  drawFittedImage() {
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#020604';
+    ctx.fillRect(0, 0, W, H);
+    if (!this.image) return;
+
+    const s = Math.min(W / this.image.width, H / this.image.height);
+    const dw = this.image.width * s;
+    const dh = this.image.height * s;
+    ctx.drawImage(this.image, (W - dw) / 2, (H - dh) / 2, dw, dh);
+  }
+
+  paintEmpty() {
+    const g = this.ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, W * 0.7);
+    g.addColorStop(0, '#0b2416');
+    g.addColorStop(1, '#010302');
+    this.ctx.fillStyle = g;
+    this.ctx.fillRect(0, 0, W, H);
+    this.ctx.fillStyle = 'rgba(80,255,130,.75)';
+    this.ctx.font = '600 20px monospace';
+    this.ctx.textAlign = 'center';
+    this.ctx.fillText('IKABOT // EN ATTENTE', W / 2, H / 2);
+  }
+
+  status(message, type) {
+    const el = document.getElementById('status');
+    el.className = 'status ' + (type || '');
+    el.textContent = message;
+  }
 }
 
-FACE:
-{
-  scaleX: ${this.debugParams.face.scaleX},
-  scaleY: ${this.debugParams.face.scaleY},
-  scaleZ: ${this.debugParams.face.scaleZ},
-  posOffsetX: ${this.debugParams.face.posOffsetX},
-  posOffsetY: ${this.debugParams.face.posOffsetY},
-  posOffsetZ: ${this.debugParams.face.posOffsetZ},
-  rotationX: ${this.debugParams.face.rotationX},
-  rotationY: ${this.debugParams.face.rotationY},
-  rotationZ: ${this.debugParams.face.rotationZ}
-}`;
-    }
-    
-    initEventListeners() {
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
-        const processBtn = document.getElementById('processBtn');
-        const exportBtn = document.getElementById('exportBtn');
-        uploadArea.addEventListener('click', () => fileInput.click());
-        uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
-        uploadArea.addEventListener('dragleave', () => { uploadArea.classList.remove('dragover'); });
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file && file.type.startsWith('image/')) this.loadImage(file);
-        });
-        fileInput.addEventListener('change', (e) => { const file = e.target.files[0]; if (file) this.loadImage(file); });
-        processBtn.addEventListener('click', () => this.processImage());
-        exportBtn.addEventListener('click', () => this.exportGLB());
-    }
-    
-    loadImage(file) {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            const preview = document.getElementById('preview');
-            preview.src = e.target.result;
-            preview.style.display = 'block';
-            const img = new Image();
-            img.onload = () => {
-                this.currentImage = img;
-                document.getElementById('processBtn').disabled = false;
-                this.showStatus('Image loaded. Ready to process.', 'success');
-            };
-            img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
-    }
-    
-    async processImage() {
-        if (!this.currentImage || !this.faceLandmarker) return;
-        try {
-            document.getElementById('processBtn').disabled = true;
-            document.getElementById('processBtnText').innerHTML = '<span class="spinner"></span> Processing...';
-            this.showStatus('Detecting face landmarks...', 'loading');
-            const results = this.faceLandmarker.detect(this.currentImage);
-            if (!results.faceLandmarks || results.faceLandmarks.length === 0) throw new Error('No face detected in the image');
-            const landmarks = results.faceLandmarks[0];
-            const blendshapes = results.faceBlendshapes?.[0]?.categories || [];
-            const transformMatrix = results.facialTransformationMatrixes?.[0];
-            const mapper = new ARKitBlendshapeMapper();
-            this.blendshapes = mapper.mapMediaPipeToARKit(blendshapes, landmarks);
-            this.showStatus('Generating face texture...', 'loading');
-            const textureMapper = new TextureMapper();
-            this.textureCanvas = textureMapper.createFaceTexture(this.currentImage, landmarks);
-            this.showStatus('Generating 3D model with morph targets...', 'loading');
-            const meshGenerator = new FaceMeshGenerator();
-            this.faceMesh = meshGenerator.generateWithMorphTargets(landmarks, this.blendshapes, transformMatrix, this.textureCanvas);
-            const oldMesh = this.scene.getObjectByName('faceMesh');
-            if (oldMesh) this.scene.remove(oldMesh);
-            this.faceMesh.name = 'faceMesh';
-            this.scene.add(this.faceMesh);
-            
-            if (this.headModel) {
-                this.headModel.visible = true;
-                this.faceMesh.geometry.computeBoundingBox();
-                const faceBox = this.faceMesh.geometry.boundingBox;
-                const faceWidth = faceBox.max.x - faceBox.min.x;
-                const faceHeight = faceBox.max.y - faceBox.min.y;
-                const faceCenter = faceBox.getCenter(new THREE.Vector3());
-                const originalPosition = this.faceMesh.position.clone();
-                
-                const headBox = new THREE.Box3().setFromObject(this.headModel);
-                
-                this.faceData = { faceWidth, faceHeight, faceCenter, headBox, originalPosition };
-                
-                const skinColor = this.faceMesh.userData.skinColor;
-                if (skinColor) {
-                    this.headModel.traverse((child) => {
-                        if (child.isMesh) {
-                            const r = Math.max(skinColor.r * 1.2, 0.5);
-                            const g = Math.max(skinColor.g * 1.2, 0.4);
-                            const b = Math.max(skinColor.b * 1.2, 0.3);
-                            child.material.color.setRGB(r, g, b);
-                            child.material.emissive.setRGB(r * 0.3, g * 0.3, b * 0.3);
-                            child.material.needsUpdate = true;
-                        }
-                    });
-                }
-                
-                this.updateHeadTransform();
-                this.faceMesh.renderOrder = 2;
-                this.headModel.renderOrder = 1;
-            }
-            
-            this.displayBlendshapes();
-            document.getElementById('exportBtn').disabled = false;
-            this.showStatus('3D model with texture and morph targets generated!', 'success');
-        } catch (error) {
-            console.error('Processing error:', error);
-            this.showStatus('Error: ' + error.message, 'error');
-        } finally {
-            document.getElementById('processBtn').disabled = false;
-            document.getElementById('processBtnText').textContent = 'Process Image';
-        }
-    }
-    
-    displayBlendshapes() {
-        const panel = document.getElementById('blendshapesPanel');
-        const list = document.getElementById('blendshapesList');
-        list.innerHTML = '';
-        Object.entries(this.blendshapes)
-            .filter(([name, value]) => value > 0.01)
-            .sort((a, b) => b[1] - a[1])
-            .forEach(([name, value]) => {
-                const item = document.createElement('div');
-                item.className = 'blendshape-item';
-                item.innerHTML = `<span class="blendshape-name">${name}</span><span class="blendshape-value">${(value * 100).toFixed(1)}%</span>`;
-                list.appendChild(item);
-            });
-        panel.style.display = 'block';
-    }
-    
-    async exportGLB() {
-        if (!this.faceMesh) return;
-        try {
-            document.getElementById('exportBtn').disabled = true;
-            this.showStatus('Exporting GLB with texture and morph targets...', 'loading');
-            const exporter = new GLTFExporter();
-            const options = { binary: true, maxTextureSize: 2048, embedImages: true, truncateDrawRange: false };
-            const exportGroup = new THREE.Group();
-            exportGroup.add(this.faceMesh.clone());
-            if (this.headModel && this.headModel.visible) exportGroup.add(this.headModel.clone());
-            exporter.parse(exportGroup, (result) => {
-                if (result instanceof ArrayBuffer) {
-                    this.saveArrayBuffer(result, 'face-model-blendshapes.glb');
-                    this.showStatus('GLB model exported successfully!', 'success');
-                }
-            }, (error) => {
-                console.error('Export error:', error);
-                this.showStatus('Export failed: ' + error.message, 'error');
-            }, options);
-        } catch (error) {
-            console.error('Export error:', error);
-            this.showStatus('Export failed: ' + error.message, 'error');
-        } finally {
-            document.getElementById('exportBtn').disabled = false;
-        }
-    }
-    
-    saveArrayBuffer(buffer, filename) {
-        const blob = new Blob([buffer], { type: 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        link.click();
-        URL.revokeObjectURL(url);
-    }
-    
-    showStatus(message, type) {
-        const status = document.getElementById('status');
-        status.textContent = message;
-        status.className = `status ${type}`;
-        status.style.display = 'block';
-        if (type === 'success') setTimeout(() => { status.style.display = 'none'; }, 3000);
-    }
-    
-    onResize() {
-        const container = this.renderer.domElement.parentElement;
-        this.camera.aspect = container.clientWidth / container.clientHeight;
-        this.camera.updateProjectionMatrix();
-        this.renderer.setSize(container.clientWidth, container.clientHeight);
-    }
-    
-    animate() {
-        requestAnimationFrame(() => this.animate());
-        this.controls.update();
-        this.renderer.render(this.scene, this.camera);
-    }
-}
-new FaceToBlendshape3D();
+new Ikabot2DRig();
